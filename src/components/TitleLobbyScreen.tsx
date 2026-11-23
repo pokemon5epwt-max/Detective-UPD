@@ -1,12 +1,27 @@
 import { useEffect, useState } from 'react';
-import { Check, Copy, LogOut, Play, Puzzle, Users, Volume2, VolumeX, X } from 'lucide-react';
+import {
+  Check,
+  Copy,
+  LogOut,
+  Play,
+  Puzzle,
+  RefreshCw,
+  Users,
+  Volume2,
+  VolumeX,
+  X,
+} from 'lucide-react';
 import { CASE_IMAGES } from '../assets/caseImages';
+import type { TransportStatus } from '../hooks/useDetectiveSocket';
 import type { ObrMode } from '../hooks/useOwlbearRodeo';
 import { HOENN_CASE_DATA } from '../shared/caseData';
 import type { RoomSnapshot } from '../shared/types';
 
 interface TitleLobbyScreenProps {
   connected: boolean;
+  transportStatus?: TransportStatus;
+  connectionHint?: string | null;
+  onRetryConnection?: () => void;
   playerId: string | null;
   snapshot: RoomSnapshot | null;
   errorMsg: string | null;
@@ -24,6 +39,9 @@ interface TitleLobbyScreenProps {
 
 export function TitleLobbyScreen({
   connected,
+  transportStatus = connected ? 'ws' : 'connecting',
+  connectionHint = null,
+  onRetryConnection,
   playerId,
   snapshot,
   errorMsg,
@@ -192,12 +210,45 @@ export function TitleLobbyScreen({
                 <h2 className="font-display text-2xl font-bold text-slate-50">
                   Masuk ke Ruang Kasus
                 </h2>
-                <p className="mt-1 text-sm text-slate-400">
-                  Status koneksi:{' '}
-                  <span className={connected ? 'text-emerald-400' : 'text-amber-300'}>
-                    {connected ? 'Terhubung ke server' : 'Menghubungkan...'}
-                  </span>
-                </p>
+                <div className="mt-1 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-400">
+                  <p>
+                    Status koneksi:{' '}
+                    <span
+                      className={
+                        connected
+                          ? 'text-emerald-400'
+                          : transportStatus === 'error'
+                          ? 'text-red-400'
+                          : 'text-amber-300'
+                      }
+                    >
+                      {connected
+                        ? transportStatus === 'http'
+                          ? 'Terhubung (Mode Kompatibel)'
+                          : 'Terhubung ke server'
+                        : transportStatus === 'error'
+                        ? 'Gagal terhubung'
+                        : 'Menghubungkan...'}
+                    </span>
+                  </p>
+
+                  {!connected && onRetryConnection && (
+                    <button
+                      type="button"
+                      onClick={onRetryConnection}
+                      className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs font-medium text-slate-200 transition-colors hover:border-amber-400 hover:text-amber-200 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      <span>Hubungkan Ulang</span>
+                    </button>
+                  )}
+                </div>
+
+                {connectionHint && !connected && (
+                  <p className="mt-2 rounded-lg border border-amber-500/40 bg-amber-950/35 px-3 py-2 text-xs leading-relaxed text-amber-200">
+                    {connectionHint}
+                  </p>
+                )}
               </div>
 
               <label className="flex flex-col gap-1.5">
@@ -323,6 +374,15 @@ export function TitleLobbyScreen({
                           )}
                         </button>
                       </div>
+
+                      {typeof window !== 'undefined' &&
+                        window.location.hostname.includes('ais-dev-') && (
+                          <p className="text-[11px] leading-relaxed text-amber-300/90">
+                            Catatan: URL preview dev membutuhkan login Google. Agar stabil di dalam
+                            Owlbear Rodeo, gunakan URL publik hasil Share / Deploy (mis. Fly.io atau
+                            App URL yang sudah dipublikasikan).
+                          </p>
+                        )}
                     </div>
                   )}
                 </div>

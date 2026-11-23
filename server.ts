@@ -24,6 +24,19 @@ const PORT = Number(process.env.PORT) || 3000;
 const MAX_PLAYERS = 5;
 const PLAYER_COLORS = ['#F59E0B', '#38BDF8', '#10B981', '#F472B6', '#A78BFA'];
 
+interface ClientConnection {
+  id: string;
+  kind: 'ws' | 'http';
+  ws?: WebSocket & { isAlive?: boolean };
+  queue: ServerMessage[];
+  waiter: ((msgs: ServerMessage[]) => void) | null;
+  waiterTimer: ReturnType<typeof setTimeout> | null;
+  lastSeen: number;
+  roomCode?: string;
+  playerId?: string;
+  closed: boolean;
+}
+
 interface ServerRoom {
   roomCode: string;
   hostId: string;
@@ -35,7 +48,7 @@ interface ServerRoom {
   comboExpiresAt: number;
   caseData: CaseData;
   players: Map<string, PlayerState>;
-  sockets: Map<string, WebSocket>;
+  connections: Map<string, ClientConnection>;
   foundClueIds: Set<string>;
   unlockedTraitIds: Set<string>;
   activeDialogue: {
@@ -51,7 +64,7 @@ interface ServerRoom {
 }
 
 const rooms = new Map<string, ServerRoom>();
-const socketMeta = new Map<WebSocket, { roomCode: string; playerId: string }>();
+const httpSessions = new Map<string, ClientConnection>();
 
 function generateRoomCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -66,19 +79,41 @@ function generatePlayerId(): string {
   return `det_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function sendToSocket(ws: WebSocket | undefined, msg: ServerMessage): void {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
+function generateSessionId(): string {
+  return `rt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function flushHttpWaiter(conn: ClientConnection): void {
+  if (!conn.waiter) return;
+  const waiter = conn.waiter;
+  conn.waiter = null;
+  if (conn.waiterTimer) {
+    clearTimeout(conn.waiterTimer);
+    conn.waiterTimer = null;
   }
+  const batch = conn.queue.splice(0, conn.queue.length);
+  waiter(batch);
+}
+
+function sendToConn(conn: ClientConnection | undefined, msg: ServerMessage): void {
+  if (!conn || conn.closed) return;
+  if (conn.kind === 'ws') {
+    if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+      conn.ws.send(JSON.stringify(msg));
+    }
+    return;
+  }
+  conn.queue.push(msg);
+  if (conn.queue.length > 150) {
+    conn.queue.shift();
+  }
+  flushHttpWaiter(conn);
 }
 
 function broadcastToRoom(room: ServerRoom, msg: ServerMessage, excludePlayerId?: string): void {
-  const serialized = JSON.stringify(msg);
-  for (const [pid, ws] of room.sockets.entries()) {
+  for (const [pid, conn] of room.connections.entries()) {
     if (excludePlayerId && pid === excludePlayerId) continue;
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(serialized);
-    }
+    sendToConn(conn, msg);
   }
 }
 
@@ -281,27 +316,36 @@ function transitionToPhase(room: ServerRoom, target: 'CRIME_SCENE' | 'INVESTIGAT
   broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
 }
 
-function handleDisconnect(ws: WebSocket): void {
-  const meta = socketMeta.get(ws);
-  if (!meta) return;
-  socketMeta.delete(ws);
+function handleDisconnect(conn: ClientConnection): void {
+  if (conn.closed) return;
+  conn.closed = true;
+  flushHttpWaiter(conn);
+  if (conn.kind === 'http') {
+    httpSessions.delete(conn.id);
+  }
 
-  const room = rooms.get(meta.roomCode);
+  const { roomCode, playerId } = conn;
+  conn.roomCode = undefined;
+  conn.playerId = undefined;
+  if (!roomCode || !playerId) return;
+
+  const room = rooms.get(roomCode);
   if (!room) return;
 
-  const leavingPlayer = room.players.get(meta.playerId);
-  room.players.delete(meta.playerId);
-  room.sockets.delete(meta.playerId);
+  const leavingPlayer = room.players.get(playerId);
+  room.players.delete(playerId);
+  room.connections.delete(playerId);
 
-  if (meta.playerId === room.hostId) {
+  if (playerId === room.hostId) {
     clearRoomTimers(room);
     broadcastToRoom(room, {
       type: 'room:closed',
       reason: 'HOST_LEFT',
       message: 'Host (Player 1) meninggalkan sesi. Room ditutup untuk seluruh detektif.',
     });
-    for (const peerWs of room.sockets.values()) {
-      socketMeta.delete(peerWs);
+    for (const peerConn of room.connections.values()) {
+      peerConn.roomCode = undefined;
+      peerConn.playerId = undefined;
     }
     rooms.delete(room.roomCode);
     return;
@@ -330,14 +374,462 @@ function handleDisconnect(ws: WebSocket): void {
   broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
 }
 
+function handleClientMessage(conn: ClientConnection, msg: ClientMessage): void {
+  conn.lastSeen = Date.now();
+
+  if (msg.type === 'room:create') {
+    const cleanName = msg.playerName.trim().slice(0, 20) || 'Detektif 1';
+    const roomCode = generateRoomCode();
+    const playerId = generatePlayerId();
+    const caseData = createFreshCaseData();
+
+    const hostPlayer: PlayerState = {
+      id: playerId,
+      name: cleanName,
+      color: PLAYER_COLORS[0],
+      isHost: true,
+      isSpectator: false,
+      connected: true,
+      currentSceneId: caseData.scenes[0].sceneId,
+      cursorX: 960,
+      cursorY: 540,
+      penaltyUntil: 0,
+    };
+
+    const room: ServerRoom = {
+      roomCode,
+      hostId: playerId,
+      sessionLocked: false,
+      phase: 'LOBBY',
+      timeRemaining: caseData.crimeSceneTimeSeconds,
+      score: 0,
+      comboCount: 0,
+      comboExpiresAt: 0,
+      caseData,
+      players: new Map([[playerId, hostPlayer]]),
+      connections: new Map([[playerId, conn]]),
+      foundClueIds: new Set(),
+      unlockedTraitIds: new Set(),
+      activeDialogue: {
+        suspectId: caseData.suspects[0].suspectID,
+        currentNodeId: caseData.suspects[0].startNodeId,
+        unlockedHints: [],
+      },
+      votes: new Map(),
+      verdictSummary: null,
+      investigationLogs: [],
+      timerInterval: null,
+      transitionTimeout: null,
+    };
+
+    rooms.set(roomCode, room);
+    conn.roomCode = roomCode;
+    conn.playerId = playerId;
+    sendToConn(conn, { type: 'room:joined', playerId, snapshot: buildSnapshot(room) });
+    return;
+  }
+
+  if (msg.type === 'room:join') {
+    const normalizedCode = msg.roomCode.trim().toUpperCase();
+    const room = rooms.get(normalizedCode);
+    if (!room) {
+      sendToConn(conn, { type: 'room:error', message: 'Kode room tidak ditemukan.' });
+      return;
+    }
+    const isLateJoin = room.sessionLocked || room.phase !== 'LOBBY';
+    const activePlayers = Array.from(room.players.values()).filter((p) => !p.isSpectator);
+    const spectators = Array.from(room.players.values()).filter((p) => p.isSpectator);
+
+    if (!isLateJoin && activePlayers.length >= MAX_PLAYERS) {
+      sendToConn(conn, {
+        type: 'room:error',
+        message: 'Room sudah penuh (maksimal 5 detektif).',
+      });
+      return;
+    }
+
+    if (isLateJoin && spectators.length >= 10) {
+      sendToConn(conn, {
+        type: 'room:error',
+        message: 'Kapasitas penonton di room ini sudah penuh.',
+      });
+      return;
+    }
+
+    const usedColors = new Set(activePlayers.map((p) => p.color));
+    const assignedColor = isLateJoin
+      ? '#94A3B8'
+      : PLAYER_COLORS.find((c) => !usedColors.has(c)) ||
+        PLAYER_COLORS[activePlayers.length % PLAYER_COLORS.length];
+
+    const playerId = generatePlayerId();
+    const cleanName =
+      msg.playerName.trim().slice(0, 20) ||
+      (isLateJoin ? `Penonton ${spectators.length + 1}` : `Detektif ${activePlayers.length + 1}`);
+    const newPlayer: PlayerState = {
+      id: playerId,
+      name: cleanName,
+      color: assignedColor,
+      isHost: false,
+      isSpectator: isLateJoin,
+      connected: true,
+      currentSceneId: room.caseData.scenes[0].sceneId,
+      cursorX: 960,
+      cursorY: 540,
+      penaltyUntil: 0,
+    };
+
+    room.players.set(playerId, newPlayer);
+    room.connections.set(playerId, conn);
+    conn.roomCode = normalizedCode;
+    conn.playerId = playerId;
+
+    sendToConn(conn, { type: 'room:joined', playerId, snapshot: buildSnapshot(room) });
+    if (isLateJoin) {
+      appendLog(room, 'SYSTEM', `${cleanName} bergabung sebagai penonton.`);
+      broadcastToRoom(
+        room,
+        { type: 'notice:info', message: `${cleanName} bergabung sebagai penonton.` },
+        playerId
+      );
+    }
+    broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) }, playerId);
+    return;
+  }
+
+  if (!conn.roomCode || !conn.playerId) return;
+  const room = rooms.get(conn.roomCode);
+  if (!room) return;
+  const player = room.players.get(conn.playerId);
+  if (!player) return;
+
+  switch (msg.type) {
+    case 'room:start_game': {
+      if (player.id !== room.hostId) return;
+      if (room.phase !== 'LOBBY') return;
+      room.sessionLocked = true;
+      room.score = 0;
+      room.comboCount = 0;
+      room.comboExpiresAt = 0;
+      room.foundClueIds.clear();
+      room.unlockedTraitIds.clear();
+      room.caseData = createFreshCaseData();
+      room.activeDialogue.unlockedHints = [];
+      room.verdictSummary = null;
+      room.investigationLogs = [];
+      for (const p of room.players.values()) {
+        p.currentSceneId = room.caseData.scenes[0].sceneId;
+        p.penaltyUntil = 0;
+      }
+      transitionToPhase(room, 'CRIME_SCENE');
+      break;
+    }
+
+    case 'room:restart_lobby': {
+      if (player.id !== room.hostId) return;
+      clearRoomTimers(room);
+      room.sessionLocked = false;
+      room.phase = 'LOBBY';
+      room.score = 0;
+      room.comboCount = 0;
+      room.comboExpiresAt = 0;
+      room.foundClueIds.clear();
+      room.unlockedTraitIds.clear();
+      room.votes.clear();
+      room.caseData = createFreshCaseData();
+      room.timeRemaining = room.caseData.crimeSceneTimeSeconds;
+      room.activeDialogue = {
+        suspectId: room.caseData.suspects[0].suspectID,
+        currentNodeId: room.caseData.suspects[0].startNodeId,
+        unlockedHints: [],
+      };
+      room.verdictSummary = null;
+      room.investigationLogs = [];
+
+      // Promote waiting spectators into open detective slots (up to MAX_PLAYERS)
+      const activeList = Array.from(room.players.values()).filter((p) => !p.isSpectator);
+      const usedColors = new Set(activeList.map((p) => p.color));
+      let activeCount = activeList.length;
+      for (const p of room.players.values()) {
+        if (p.isSpectator && activeCount < MAX_PLAYERS) {
+          p.isSpectator = false;
+          const nextColor =
+            PLAYER_COLORS.find((c) => !usedColors.has(c)) ||
+            PLAYER_COLORS[activeCount % PLAYER_COLORS.length];
+          p.color = nextColor;
+          usedColors.add(nextColor);
+          activeCount += 1;
+        }
+      }
+
+      for (const p of room.players.values()) {
+        p.currentSceneId = room.caseData.scenes[0].sceneId;
+        p.penaltyUntil = 0;
+      }
+
+      broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
+      break;
+    }
+
+    case 'scene:select': {
+      if (player.isSpectator) return;
+      if (room.phase !== 'CRIME_SCENE') return;
+      const validScene = room.caseData.scenes.some((s) => s.sceneId === msg.sceneId);
+      if (!validScene) return;
+      player.currentSceneId = msg.sceneId;
+      broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
+      break;
+    }
+
+    case 'cursor:move': {
+      if (player.isSpectator) return;
+      const x = Math.max(0, Math.min(1920, Math.round(msg.x)));
+      const y = Math.max(0, Math.min(1080, Math.round(msg.y)));
+      player.cursorX = x;
+      player.cursorY = y;
+      broadcastToRoom(
+        room,
+        {
+          type: 'cursor:update',
+          playerId: player.id,
+          sceneId: player.currentSceneId,
+          x,
+          y,
+        },
+        player.id
+      );
+      break;
+    }
+
+    case 'clue:click': {
+      if (player.isSpectator) return;
+      if (room.phase !== 'CRIME_SCENE') return;
+      const targetSceneId = msg.sceneId || player.currentSceneId;
+      if (!room.caseData.scenes.some((s) => s.sceneId === targetSceneId)) return;
+
+      const now = Date.now();
+      if (player.penaltyUntil > now) {
+        sendToConn(conn, {
+          type: 'clue:result',
+          status: 'COOLDOWN',
+          playerId: player.id,
+          playerName: player.name,
+          sceneId: targetSceneId,
+          x: msg.x,
+          y: msg.y,
+          cooldownMs: player.penaltyUntil - now,
+        });
+        return;
+      }
+
+      const tolerance = 18;
+      const matchedClue = room.caseData.clues.find((clue) => {
+        if (clue.scene !== targetSceneId) return false;
+        if (msg.clueId && clue.clueID !== msg.clueId) return false;
+        return (
+          msg.x >= clue.hotspot.x - tolerance &&
+          msg.x <= clue.hotspot.x + clue.hotspot.width + tolerance &&
+          msg.y >= clue.hotspot.y - tolerance &&
+          msg.y <= clue.hotspot.y + clue.hotspot.height + tolerance
+        );
+      });
+
+      if (!matchedClue) {
+        const penaltySeconds = 10;
+        const sceneTitle =
+          room.caseData.scenes.find((s) => s.sceneId === targetSceneId)?.title || targetSceneId;
+        room.timeRemaining = Math.max(0, room.timeRemaining - penaltySeconds);
+        room.comboCount = 0;
+        room.comboExpiresAt = 0;
+        player.penaltyUntil = now + 1500;
+        appendLog(room, 'PENALTY', `Salah klik di ${sceneTitle} (-${penaltySeconds} detik).`, player);
+        broadcastToRoom(room, {
+          type: 'clue:result',
+          status: 'MISS',
+          playerId: player.id,
+          playerName: player.name,
+          sceneId: targetSceneId,
+          x: msg.x,
+          y: msg.y,
+          penaltySeconds,
+        });
+        if (room.timeRemaining <= 0) {
+          transitionToPhase(room, 'INVESTIGATION_BOARD');
+        } else {
+          broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
+        }
+        return;
+      }
+
+      if (room.foundClueIds.has(matchedClue.clueID)) {
+        sendToConn(conn, {
+          type: 'clue:result',
+          status: 'ALREADY_FOUND',
+          playerId: player.id,
+          playerName: player.name,
+          sceneId: targetSceneId,
+          clueId: matchedClue.clueID,
+          clueName: matchedClue.name,
+          x: msg.x,
+          y: msg.y,
+        });
+        return;
+      }
+
+      room.foundClueIds.add(matchedClue.clueID);
+      matchedClue.found = true;
+      matchedClue.foundByPlayerName = player.name;
+
+      if (now <= room.comboExpiresAt) {
+        room.comboCount += 1;
+      } else {
+        room.comboCount = 1;
+      }
+      room.comboExpiresAt = now + 12000;
+      const comboMultiplier = Math.min(5, room.comboCount);
+      const pointsEarned = 150 * comboMultiplier;
+      room.score += pointsEarned;
+
+      const sceneTitle =
+        room.caseData.scenes.find((s) => s.sceneId === targetSceneId)?.title || targetSceneId;
+      appendLog(
+        room,
+        'CLUE',
+        `Menemukan bukti: ${matchedClue.name} di ${sceneTitle} (+${pointsEarned} skor${
+          comboMultiplier > 1 ? ` · Combo x${comboMultiplier}` : ''
+        }).`,
+        player
+      );
+      unlockKillerTrait(room, matchedClue.unlocksTraitId);
+
+      broadcastToRoom(room, {
+        type: 'clue:result',
+        status: 'FOUND',
+        playerId: player.id,
+        playerName: player.name,
+        sceneId: targetSceneId,
+        clueId: matchedClue.clueID,
+        clueName: matchedClue.name,
+        x: matchedClue.hotspot.x + matchedClue.hotspot.width / 2,
+        y: matchedClue.hotspot.y + matchedClue.hotspot.height / 2,
+        pointsEarned,
+        comboMultiplier,
+      });
+      broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
+
+      if (room.foundClueIds.size >= room.caseData.clues.length && !room.transitionTimeout) {
+        room.transitionTimeout = setTimeout(() => {
+          if (room.phase === 'CRIME_SCENE') {
+            transitionToPhase(room, 'INVESTIGATION_BOARD');
+          }
+        }, 1400);
+      }
+      break;
+    }
+
+    case 'phase:advance': {
+      if (player.id !== room.hostId) return;
+      if (msg.targetPhase === 'INVESTIGATION_BOARD' && room.phase === 'CRIME_SCENE') {
+        transitionToPhase(room, 'INVESTIGATION_BOARD');
+      } else if (msg.targetPhase === 'VERDICT' && room.phase === 'INVESTIGATION_BOARD') {
+        transitionToPhase(room, 'VERDICT');
+      }
+      break;
+    }
+
+    case 'dialogue:select_suspect': {
+      if (player.isSpectator) return;
+      if (room.phase !== 'INVESTIGATION_BOARD') return;
+      const suspect = room.caseData.suspects.find((s) => s.suspectID === msg.suspectId);
+      if (!suspect) return;
+      if (room.activeDialogue.suspectId !== suspect.suspectID) {
+        appendLog(room, 'INTERROGATION', `Membuka interogasi dengan ${suspect.name}.`, player);
+      }
+      room.activeDialogue.suspectId = suspect.suspectID;
+      room.activeDialogue.currentNodeId = suspect.startNodeId;
+      broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
+      break;
+    }
+
+    case 'dialogue:choose': {
+      if (player.isSpectator) return;
+      if (room.phase !== 'INVESTIGATION_BOARD') return;
+      const currentNode = room.caseData.dialogueNodes[room.activeDialogue.currentNodeId];
+      if (!currentNode) return;
+      const choice = currentNode.choices.find((c) => c.id === msg.choiceId);
+      if (!choice) return;
+      if (choice.requiredClueId && !room.foundClueIds.has(choice.requiredClueId)) {
+        sendToConn(conn, {
+          type: 'notice:info',
+          message: 'Bukti terkait belum ditemukan di TKP.',
+        });
+        return;
+      }
+      if (!room.caseData.dialogueNodes[choice.nextNodeId]) return;
+
+      room.activeDialogue.currentNodeId = choice.nextNodeId;
+      if (!choice.label.startsWith('Kembali') && !choice.label.startsWith('Catat')) {
+        const suspect = room.caseData.suspects.find(
+          (s) => s.suspectID === room.activeDialogue.suspectId
+        );
+        appendLog(
+          room,
+          'INTERROGATION',
+          `Menanyakan ${suspect?.name || 'Saksi'}: "${choice.label}"`,
+          player
+        );
+      }
+      if (
+        choice.unlocksHint &&
+        !room.activeDialogue.unlockedHints.includes(choice.unlocksHint)
+      ) {
+        room.activeDialogue.unlockedHints.push(choice.unlocksHint);
+        room.score += 50;
+        appendLog(room, 'INTERROGATION', `Fakta baru terbuka (+50 skor): ${choice.unlocksHint}`);
+      }
+      unlockKillerTrait(room, choice.unlocksTraitId);
+      broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
+      break;
+    }
+
+    case 'vote:cast': {
+      if (player.isSpectator) return;
+      if (room.phase !== 'VERDICT') return;
+      if (room.votes.has(player.id)) return;
+      const validCulprit = room.caseData.suspects.some((s) => s.suspectID === msg.culpritId);
+      const validPokemon = room.caseData.pokemonOptions.some((p) => p.pokemonId === msg.pokemonId);
+      if (!validCulprit || !validPokemon) return;
+
+      room.votes.set(player.id, {
+        culpritId: msg.culpritId,
+        pokemonId: msg.pokemonId,
+        submittedAt: Date.now(),
+      });
+      appendLog(room, 'VOTE', 'Telah mengirim suara vonis.', player);
+
+      const activePlayerCount = Array.from(room.players.values()).filter((p) => !p.isSpectator).length;
+      if (room.votes.size >= activePlayerCount) {
+        resolveVerdict(room);
+      } else {
+        broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
+      }
+      break;
+    }
+  }
+}
+
 async function startServer(): Promise<void> {
   const app = express();
   const httpServer = http.createServer(app);
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: '/ws',
+    perMessageDeflate: false,
+  });
 
   app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, HEAD, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     if (req.method === 'OPTIONS') {
       res.status(204).end();
@@ -346,462 +838,142 @@ async function startServer(): Promise<void> {
     next();
   });
 
+  app.use(express.json());
+
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, activeRooms: rooms.size });
   });
 
-  wss.on('connection', (ws: WebSocket) => {
+  // HTTP Long-Poll + POST fallback transport when WebSockets are blocked by proxies or iframe sandboxes
+  app.post('/api/rt/session', (_req, res) => {
+    const sid = generateSessionId();
+    const conn: ClientConnection = {
+      id: sid,
+      kind: 'http',
+      queue: [],
+      waiter: null,
+      waiterTimer: null,
+      lastSeen: Date.now(),
+      closed: false,
+    };
+    httpSessions.set(sid, conn);
+    res.json({ sid });
+  });
+
+  app.get('/api/rt/poll', (req, res) => {
+    const sid = typeof req.query.sid === 'string' ? req.query.sid : '';
+    const conn = httpSessions.get(sid);
+    if (!conn || conn.closed) {
+      res.status(404).json({ error: 'Session expired' });
+      return;
+    }
+    conn.lastSeen = Date.now();
+    if (conn.queue.length > 0) {
+      res.json({ messages: conn.queue.splice(0, conn.queue.length) });
+      return;
+    }
+    if (conn.waiter) {
+      flushHttpWaiter(conn);
+    }
+    conn.waiter = (messages) => {
+      if (!res.headersSent) {
+        res.json({ messages });
+      }
+    };
+    conn.waiterTimer = setTimeout(() => {
+      if (conn.waiter) {
+        conn.waiter = null;
+        conn.waiterTimer = null;
+        if (!res.headersSent) {
+          res.json({ messages: [] });
+        }
+      }
+    }, 15000);
+
+    req.on('close', () => {
+      if (conn.waiterTimer) {
+        clearTimeout(conn.waiterTimer);
+        conn.waiterTimer = null;
+      }
+      conn.waiter = null;
+    });
+  });
+
+  app.post('/api/rt/send', (req, res) => {
+    const { sid, payload } = req.body as { sid?: string; payload?: ClientMessage };
+    if (!sid || !payload || typeof payload.type !== 'string') {
+      res.status(400).json({ error: 'Invalid payload' });
+      return;
+    }
+    const conn = httpSessions.get(sid);
+    if (!conn || conn.closed) {
+      res.status(404).json({ error: 'Session expired' });
+      return;
+    }
+    handleClientMessage(conn, payload);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/rt/close', (req, res) => {
+    const { sid } = (req.body || {}) as { sid?: string };
+    if (sid) {
+      const conn = httpSessions.get(sid);
+      if (conn) {
+        handleDisconnect(conn);
+      }
+    }
+    res.json({ ok: true });
+  });
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const conn of httpSessions.values()) {
+      if (now - conn.lastSeen > 35000) {
+        handleDisconnect(conn);
+      }
+    }
+    for (const client of wss.clients) {
+      const tracked = client as WebSocket & { isAlive?: boolean };
+      if (tracked.isAlive === false) {
+        tracked.terminate();
+        continue;
+      }
+      tracked.isAlive = false;
+      tracked.ping();
+    }
+  }, 20000);
+
+  wss.on('connection', (rawWs: WebSocket) => {
+    const ws = rawWs as WebSocket & { isAlive?: boolean };
+    ws.isAlive = true;
+    ws.on('pong', () => {
+      ws.isAlive = true;
+    });
+
+    const conn: ClientConnection = {
+      id: generateSessionId(),
+      kind: 'ws',
+      ws,
+      queue: [],
+      waiter: null,
+      waiterTimer: null,
+      lastSeen: Date.now(),
+      closed: false,
+    };
+
     ws.on('message', (raw) => {
       let msg: ClientMessage;
       try {
         msg = JSON.parse(raw.toString()) as ClientMessage;
       } catch {
-        sendToSocket(ws, { type: 'room:error', message: 'Format pesan tidak valid.' });
+        sendToConn(conn, { type: 'room:error', message: 'Format pesan tidak valid.' });
         return;
       }
-
-      if (msg.type === 'room:create') {
-        const cleanName = msg.playerName.trim().slice(0, 20) || 'Detektif 1';
-        const roomCode = generateRoomCode();
-        const playerId = generatePlayerId();
-        const caseData = createFreshCaseData();
-
-        const hostPlayer: PlayerState = {
-          id: playerId,
-          name: cleanName,
-          color: PLAYER_COLORS[0],
-          isHost: true,
-          isSpectator: false,
-          connected: true,
-          currentSceneId: caseData.scenes[0].sceneId,
-          cursorX: 960,
-          cursorY: 540,
-          penaltyUntil: 0,
-        };
-
-        const room: ServerRoom = {
-          roomCode,
-          hostId: playerId,
-          sessionLocked: false,
-          phase: 'LOBBY',
-          timeRemaining: caseData.crimeSceneTimeSeconds,
-          score: 0,
-          comboCount: 0,
-          comboExpiresAt: 0,
-          caseData,
-          players: new Map([[playerId, hostPlayer]]),
-          sockets: new Map([[playerId, ws]]),
-          foundClueIds: new Set(),
-          unlockedTraitIds: new Set(),
-          activeDialogue: {
-            suspectId: caseData.suspects[0].suspectID,
-            currentNodeId: caseData.suspects[0].startNodeId,
-            unlockedHints: [],
-          },
-          votes: new Map(),
-          verdictSummary: null,
-          investigationLogs: [],
-          timerInterval: null,
-          transitionTimeout: null,
-        };
-
-        rooms.set(roomCode, room);
-        socketMeta.set(ws, { roomCode, playerId });
-        sendToSocket(ws, { type: 'room:joined', playerId, snapshot: buildSnapshot(room) });
-        return;
-      }
-
-      if (msg.type === 'room:join') {
-        const normalizedCode = msg.roomCode.trim().toUpperCase();
-        const room = rooms.get(normalizedCode);
-        if (!room) {
-          sendToSocket(ws, { type: 'room:error', message: 'Kode room tidak ditemukan.' });
-          return;
-        }
-        const isLateJoin = room.sessionLocked || room.phase !== 'LOBBY';
-        const activePlayers = Array.from(room.players.values()).filter((p) => !p.isSpectator);
-        const spectators = Array.from(room.players.values()).filter((p) => p.isSpectator);
-
-        if (!isLateJoin && activePlayers.length >= MAX_PLAYERS) {
-          sendToSocket(ws, {
-            type: 'room:error',
-            message: 'Room sudah penuh (maksimal 5 detektif).',
-          });
-          return;
-        }
-
-        if (isLateJoin && spectators.length >= 10) {
-          sendToSocket(ws, {
-            type: 'room:error',
-            message: 'Kapasitas penonton di room ini sudah penuh.',
-          });
-          return;
-        }
-
-        const usedColors = new Set(activePlayers.map((p) => p.color));
-        const assignedColor = isLateJoin
-          ? '#94A3B8'
-          : PLAYER_COLORS.find((c) => !usedColors.has(c)) ||
-            PLAYER_COLORS[activePlayers.length % PLAYER_COLORS.length];
-
-        const playerId = generatePlayerId();
-        const cleanName =
-          msg.playerName.trim().slice(0, 20) ||
-          (isLateJoin ? `Penonton ${spectators.length + 1}` : `Detektif ${activePlayers.length + 1}`);
-        const newPlayer: PlayerState = {
-          id: playerId,
-          name: cleanName,
-          color: assignedColor,
-          isHost: false,
-          isSpectator: isLateJoin,
-          connected: true,
-          currentSceneId: room.caseData.scenes[0].sceneId,
-          cursorX: 960,
-          cursorY: 540,
-          penaltyUntil: 0,
-        };
-
-        room.players.set(playerId, newPlayer);
-        room.sockets.set(playerId, ws);
-        socketMeta.set(ws, { roomCode: normalizedCode, playerId });
-
-        sendToSocket(ws, { type: 'room:joined', playerId, snapshot: buildSnapshot(room) });
-        if (isLateJoin) {
-          appendLog(room, 'SYSTEM', `${cleanName} bergabung sebagai penonton.`);
-          broadcastToRoom(
-            room,
-            { type: 'notice:info', message: `${cleanName} bergabung sebagai penonton.` },
-            playerId
-          );
-        }
-        broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) }, playerId);
-        return;
-      }
-
-      const meta = socketMeta.get(ws);
-      if (!meta) return;
-      const room = rooms.get(meta.roomCode);
-      if (!room) return;
-      const player = room.players.get(meta.playerId);
-      if (!player) return;
-
-      switch (msg.type) {
-        case 'room:start_game': {
-          if (player.id !== room.hostId) return;
-          if (room.phase !== 'LOBBY') return;
-          room.sessionLocked = true;
-          room.score = 0;
-          room.comboCount = 0;
-          room.comboExpiresAt = 0;
-          room.foundClueIds.clear();
-          room.unlockedTraitIds.clear();
-          room.caseData = createFreshCaseData();
-          room.activeDialogue.unlockedHints = [];
-          room.verdictSummary = null;
-          room.investigationLogs = [];
-          for (const p of room.players.values()) {
-            p.currentSceneId = room.caseData.scenes[0].sceneId;
-            p.penaltyUntil = 0;
-          }
-          transitionToPhase(room, 'CRIME_SCENE');
-          break;
-        }
-
-        case 'room:restart_lobby': {
-          if (player.id !== room.hostId) return;
-          clearRoomTimers(room);
-          room.sessionLocked = false;
-          room.phase = 'LOBBY';
-          room.score = 0;
-          room.comboCount = 0;
-          room.comboExpiresAt = 0;
-          room.foundClueIds.clear();
-          room.unlockedTraitIds.clear();
-          room.votes.clear();
-          room.caseData = createFreshCaseData();
-          room.timeRemaining = room.caseData.crimeSceneTimeSeconds;
-          room.activeDialogue = {
-            suspectId: room.caseData.suspects[0].suspectID,
-            currentNodeId: room.caseData.suspects[0].startNodeId,
-            unlockedHints: [],
-          };
-          room.verdictSummary = null;
-          room.investigationLogs = [];
-
-          // Promote waiting spectators into open detective slots (up to MAX_PLAYERS)
-          const activeList = Array.from(room.players.values()).filter((p) => !p.isSpectator);
-          const usedColors = new Set(activeList.map((p) => p.color));
-          let activeCount = activeList.length;
-          for (const p of room.players.values()) {
-            if (p.isSpectator && activeCount < MAX_PLAYERS) {
-              p.isSpectator = false;
-              const nextColor =
-                PLAYER_COLORS.find((c) => !usedColors.has(c)) ||
-                PLAYER_COLORS[activeCount % PLAYER_COLORS.length];
-              p.color = nextColor;
-              usedColors.add(nextColor);
-              activeCount += 1;
-            }
-          }
-
-          for (const p of room.players.values()) {
-            p.currentSceneId = room.caseData.scenes[0].sceneId;
-            p.penaltyUntil = 0;
-          }
-
-          broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
-          break;
-        }
-
-        case 'scene:select': {
-          if (player.isSpectator) return;
-          if (room.phase !== 'CRIME_SCENE') return;
-          const validScene = room.caseData.scenes.some((s) => s.sceneId === msg.sceneId);
-          if (!validScene) return;
-          player.currentSceneId = msg.sceneId;
-          broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
-          break;
-        }
-
-        case 'cursor:move': {
-          if (player.isSpectator) return;
-          const x = Math.max(0, Math.min(1920, Math.round(msg.x)));
-          const y = Math.max(0, Math.min(1080, Math.round(msg.y)));
-          player.cursorX = x;
-          player.cursorY = y;
-          broadcastToRoom(
-            room,
-            {
-              type: 'cursor:update',
-              playerId: player.id,
-              sceneId: player.currentSceneId,
-              x,
-              y,
-            },
-            player.id
-          );
-          break;
-        }
-
-        case 'clue:click': {
-          if (player.isSpectator) return;
-          if (room.phase !== 'CRIME_SCENE') return;
-          const targetSceneId = msg.sceneId || player.currentSceneId;
-          if (!room.caseData.scenes.some((s) => s.sceneId === targetSceneId)) return;
-
-          const now = Date.now();
-          if (player.penaltyUntil > now) {
-            sendToSocket(ws, {
-              type: 'clue:result',
-              status: 'COOLDOWN',
-              playerId: player.id,
-              playerName: player.name,
-              sceneId: targetSceneId,
-              x: msg.x,
-              y: msg.y,
-              cooldownMs: player.penaltyUntil - now,
-            });
-            return;
-          }
-
-          const tolerance = 18;
-          const matchedClue = room.caseData.clues.find((clue) => {
-            if (clue.scene !== targetSceneId) return false;
-            if (msg.clueId && clue.clueID !== msg.clueId) return false;
-            return (
-              msg.x >= clue.hotspot.x - tolerance &&
-              msg.x <= clue.hotspot.x + clue.hotspot.width + tolerance &&
-              msg.y >= clue.hotspot.y - tolerance &&
-              msg.y <= clue.hotspot.y + clue.hotspot.height + tolerance
-            );
-          });
-
-          if (!matchedClue) {
-            const penaltySeconds = 10;
-            const sceneTitle =
-              room.caseData.scenes.find((s) => s.sceneId === targetSceneId)?.title || targetSceneId;
-            room.timeRemaining = Math.max(0, room.timeRemaining - penaltySeconds);
-            room.comboCount = 0;
-            room.comboExpiresAt = 0;
-            player.penaltyUntil = now + 1500;
-            appendLog(room, 'PENALTY', `Salah klik di ${sceneTitle} (-${penaltySeconds} detik).`, player);
-            broadcastToRoom(room, {
-              type: 'clue:result',
-              status: 'MISS',
-              playerId: player.id,
-              playerName: player.name,
-              sceneId: targetSceneId,
-              x: msg.x,
-              y: msg.y,
-              penaltySeconds,
-            });
-            if (room.timeRemaining <= 0) {
-              transitionToPhase(room, 'INVESTIGATION_BOARD');
-            } else {
-              broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
-            }
-            return;
-          }
-
-          if (room.foundClueIds.has(matchedClue.clueID)) {
-            sendToSocket(ws, {
-              type: 'clue:result',
-              status: 'ALREADY_FOUND',
-              playerId: player.id,
-              playerName: player.name,
-              sceneId: targetSceneId,
-              clueId: matchedClue.clueID,
-              clueName: matchedClue.name,
-              x: msg.x,
-              y: msg.y,
-            });
-            return;
-          }
-
-          room.foundClueIds.add(matchedClue.clueID);
-          matchedClue.found = true;
-          matchedClue.foundByPlayerName = player.name;
-
-          if (now <= room.comboExpiresAt) {
-            room.comboCount += 1;
-          } else {
-            room.comboCount = 1;
-          }
-          room.comboExpiresAt = now + 12000;
-          const comboMultiplier = Math.min(5, room.comboCount);
-          const pointsEarned = 150 * comboMultiplier;
-          room.score += pointsEarned;
-
-          const sceneTitle =
-            room.caseData.scenes.find((s) => s.sceneId === targetSceneId)?.title || targetSceneId;
-          appendLog(
-            room,
-            'CLUE',
-            `Menemukan bukti: ${matchedClue.name} di ${sceneTitle} (+${pointsEarned} skor${
-              comboMultiplier > 1 ? ` · Combo x${comboMultiplier}` : ''
-            }).`,
-            player
-          );
-          unlockKillerTrait(room, matchedClue.unlocksTraitId);
-
-          broadcastToRoom(room, {
-            type: 'clue:result',
-            status: 'FOUND',
-            playerId: player.id,
-            playerName: player.name,
-            sceneId: targetSceneId,
-            clueId: matchedClue.clueID,
-            clueName: matchedClue.name,
-            x: matchedClue.hotspot.x + matchedClue.hotspot.width / 2,
-            y: matchedClue.hotspot.y + matchedClue.hotspot.height / 2,
-            pointsEarned,
-            comboMultiplier,
-          });
-          broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
-
-          if (room.foundClueIds.size >= room.caseData.clues.length && !room.transitionTimeout) {
-            room.transitionTimeout = setTimeout(() => {
-              if (room.phase === 'CRIME_SCENE') {
-                transitionToPhase(room, 'INVESTIGATION_BOARD');
-              }
-            }, 1400);
-          }
-          break;
-        }
-
-        case 'phase:advance': {
-          if (player.id !== room.hostId) return;
-          if (msg.targetPhase === 'INVESTIGATION_BOARD' && room.phase === 'CRIME_SCENE') {
-            transitionToPhase(room, 'INVESTIGATION_BOARD');
-          } else if (msg.targetPhase === 'VERDICT' && room.phase === 'INVESTIGATION_BOARD') {
-            transitionToPhase(room, 'VERDICT');
-          }
-          break;
-        }
-
-        case 'dialogue:select_suspect': {
-          if (player.isSpectator) return;
-          if (room.phase !== 'INVESTIGATION_BOARD') return;
-          const suspect = room.caseData.suspects.find((s) => s.suspectID === msg.suspectId);
-          if (!suspect) return;
-          if (room.activeDialogue.suspectId !== suspect.suspectID) {
-            appendLog(room, 'INTERROGATION', `Membuka interogasi dengan ${suspect.name}.`, player);
-          }
-          room.activeDialogue.suspectId = suspect.suspectID;
-          room.activeDialogue.currentNodeId = suspect.startNodeId;
-          broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
-          break;
-        }
-
-        case 'dialogue:choose': {
-          if (player.isSpectator) return;
-          if (room.phase !== 'INVESTIGATION_BOARD') return;
-          const currentNode = room.caseData.dialogueNodes[room.activeDialogue.currentNodeId];
-          if (!currentNode) return;
-          const choice = currentNode.choices.find((c) => c.id === msg.choiceId);
-          if (!choice) return;
-          if (choice.requiredClueId && !room.foundClueIds.has(choice.requiredClueId)) {
-            sendToSocket(ws, {
-              type: 'notice:info',
-              message: 'Bukti terkait belum ditemukan di TKP.',
-            });
-            return;
-          }
-          if (!room.caseData.dialogueNodes[choice.nextNodeId]) return;
-
-          room.activeDialogue.currentNodeId = choice.nextNodeId;
-          if (!choice.label.startsWith('Kembali') && !choice.label.startsWith('Catat')) {
-            const suspect = room.caseData.suspects.find(
-              (s) => s.suspectID === room.activeDialogue.suspectId
-            );
-            appendLog(
-              room,
-              'INTERROGATION',
-              `Menanyakan ${suspect?.name || 'Saksi'}: "${choice.label}"`,
-              player
-            );
-          }
-          if (
-            choice.unlocksHint &&
-            !room.activeDialogue.unlockedHints.includes(choice.unlocksHint)
-          ) {
-            room.activeDialogue.unlockedHints.push(choice.unlocksHint);
-            room.score += 50;
-            appendLog(room, 'INTERROGATION', `Fakta baru terbuka (+50 skor): ${choice.unlocksHint}`);
-          }
-          unlockKillerTrait(room, choice.unlocksTraitId);
-          broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
-          break;
-        }
-
-        case 'vote:cast': {
-          if (player.isSpectator) return;
-          if (room.phase !== 'VERDICT') return;
-          if (room.votes.has(player.id)) return;
-          const validCulprit = room.caseData.suspects.some((s) => s.suspectID === msg.culpritId);
-          const validPokemon = room.caseData.pokemonOptions.some((p) => p.pokemonId === msg.pokemonId);
-          if (!validCulprit || !validPokemon) return;
-
-          room.votes.set(player.id, {
-            culpritId: msg.culpritId,
-            pokemonId: msg.pokemonId,
-            submittedAt: Date.now(),
-          });
-          appendLog(room, 'VOTE', 'Telah mengirim suara vonis.', player);
-
-          const activePlayerCount = Array.from(room.players.values()).filter((p) => !p.isSpectator).length;
-          if (room.votes.size >= activePlayerCount) {
-            resolveVerdict(room);
-          } else {
-            broadcastToRoom(room, { type: 'room:state', snapshot: buildSnapshot(room) });
-          }
-          break;
-        }
-      }
+      handleClientMessage(conn, msg);
     });
 
-    ws.on('close', () => handleDisconnect(ws));
-    ws.on('error', () => handleDisconnect(ws));
+    ws.on('close', () => handleDisconnect(conn));
+    ws.on('error', () => handleDisconnect(conn));
   });
 
   if (process.env.NODE_ENV !== 'production') {

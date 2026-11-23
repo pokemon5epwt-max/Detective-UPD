@@ -32,6 +32,9 @@ export default function App() {
 
   const {
     connected,
+    transportStatus,
+    connectionHint,
+    retryConnection,
     playerId,
     snapshot,
     remoteCursors,
@@ -52,7 +55,7 @@ export default function App() {
     chooseDialogue,
     castVote,
     toggleMute,
-  } = useDetectiveSocket();
+  } = useDetectiveSocket({ enabled: obrMode !== 'popover' });
 
   const me = snapshot?.players.find((p) => p.id === playerId);
   const isHost = Boolean(snapshot && playerId && snapshot.hostId === playerId);
@@ -131,6 +134,9 @@ export default function App() {
       {!snapshot || !playerId || snapshot.phase === 'LOBBY' ? (
         <TitleLobbyScreen
           connected={connected}
+          transportStatus={transportStatus}
+          connectionHint={connectionHint}
+          onRetryConnection={retryConnection}
           playerId={playerId}
           snapshot={snapshot}
           errorMsg={errorMsg}
