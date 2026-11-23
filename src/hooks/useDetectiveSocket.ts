@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import OBR from '@owlbear-rodeo/sdk';
 import type { ClientMessage, GamePhase, RoomSnapshot, ServerMessage } from '../shared/types';
+import {
+  createLocalSoloSession,
+  createObrBroadcastSession,
+  type ServerlessSession,
+} from '../utils/serverlessTransport';
 import { soundEngine } from '../utils/sound';
 
 export interface SceneFeedbackMarker {
@@ -11,10 +17,26 @@ export interface SceneFeedbackMarker {
   label: string;
 }
 
-export type TransportStatus = 'connecting' | 'ws' | 'http' | 'error';
+export type TransportStatus = 'connecting' | 'ws' | 'http' | 'obr' | 'local' | 'error';
 
 interface UseDetectiveSocketOptions {
   enabled?: boolean;
+}
+
+const RAW_SERVER_URL = (import.meta.env.VITE_SERVER_URL as string | undefined)?.trim() || '';
+const SERVER_HTTP_BASE = RAW_SERVER_URL.replace(/\/+$/, '');
+
+function getWebSocketUrl(): string {
+  if (SERVER_HTTP_BASE) {
+    const wsOrigin = SERVER_HTTP_BASE.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:');
+    return `${wsOrigin}/ws`;
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws`;
+}
+
+function apiPath(path: string): string {
+  return SERVER_HTTP_BASE ? `${SERVER_HTTP_BASE}${path}` : path;
 }
 
 export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
@@ -23,12 +45,13 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
   const wsRef = useRef<WebSocket | null>(null);
   const httpSidRef = useRef<string | null>(null);
   const httpAbortRef = useRef<AbortController | null>(null);
+  const serverlessRef = useRef<ServerlessSession | null>(null);
   const wsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingQueueRef = useRef<ClientMessage[]>([]);
   const mountedRef = useRef(true);
   const lastCursorSentRef = useRef<number>(0);
   const lastPhaseRef = useRef<GamePhase | null>(null);
-  const transportModeRef = useRef<'ws' | 'http' | null>(null);
+  const transportModeRef = useRef<'ws' | 'http' | 'obr' | 'local' | null>(null);
 
   const [connected, setConnected] = useState(false);
   const [transportStatus, setTransportStatus] = useState<TransportStatus>('connecting');
@@ -180,12 +203,16 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
     if (httpSidRef.current) {
       const sid = httpSidRef.current;
       httpSidRef.current = null;
-      void fetch('/api/rt/close', {
+      void fetch(apiPath('/api/rt/close'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sid }),
         keepalive: true,
       }).catch(() => {});
+    }
+    if (serverlessRef.current) {
+      serverlessRef.current.close();
+      serverlessRef.current = null;
     }
     transportModeRef.current = null;
   }, []);
@@ -196,18 +223,57 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
       if (transportModeRef.current === 'ws' && wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify(payload));
       } else if (transportModeRef.current === 'http' && httpSidRef.current) {
-        await fetch('/api/rt/send', {
+        await fetch(apiPath('/api/rt/send'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sid: httpSidRef.current, payload }),
         }).catch(() => {});
+      } else if (
+        (transportModeRef.current === 'obr' || transportModeRef.current === 'local') &&
+        serverlessRef.current
+      ) {
+        serverlessRef.current.send(payload);
       }
     }
   }, []);
 
+  const activateServerlessFallback = useCallback(() => {
+    if (!mountedRef.current || !enabled) return;
+    if (transportModeRef.current === 'obr' || transportModeRef.current === 'local') return;
+
+    if (OBR.isAvailable) {
+      transportModeRef.current = 'obr';
+      setTransportStatus('connecting');
+      setConnectionHint(null);
+      serverlessRef.current = createObrBroadcastSession(handleServerMessage, (ready) => {
+        if (!mountedRef.current || !ready) return;
+        setConnected(true);
+        setTransportStatus('obr');
+        setConnectionHint(null);
+        void flushPendingQueue();
+      });
+      return;
+    }
+
+    transportModeRef.current = 'local';
+    serverlessRef.current = createLocalSoloSession(handleServerMessage);
+    setConnected(true);
+    setTransportStatus('local');
+    setConnectionHint(
+      'Hosting statis (Vercel) aktif dalam Mode Solo Lokal. Untuk bermain co-op multiplayer, buka game lewat ekstensi Owlbear Rodeo atau atur VITE_SERVER_URL ke server Node.js.'
+    );
+    void flushPendingQueue();
+  }, [enabled, flushPendingQueue, handleServerMessage]);
+
   const startHttpFallback = useCallback(async () => {
     if (!mountedRef.current || !enabled) return;
-    if (transportModeRef.current === 'http' && httpSidRef.current) return;
+    if (
+      transportModeRef.current === 'http' ||
+      transportModeRef.current === 'obr' ||
+      transportModeRef.current === 'local'
+    ) {
+      return;
+    }
 
     if (wsTimeoutRef.current) {
       clearTimeout(wsTimeoutRef.current);
@@ -223,7 +289,7 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
     }
 
     try {
-      const res = await fetch('/api/rt/session', { method: 'POST' });
+      const res = await fetch(apiPath('/api/rt/session'), { method: 'POST' });
       const contentType = res.headers.get('content-type') || '';
       if (!res.ok || !contentType.includes('application/json')) {
         throw new Error(`HTTP ${res.status}`);
@@ -247,9 +313,10 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
       const pollLoop = async (sid: string) => {
         while (mountedRef.current && httpSidRef.current === sid && !controller.signal.aborted) {
           try {
-            const pollRes = await fetch(`/api/rt/poll?sid=${encodeURIComponent(sid)}`, {
-              signal: controller.signal,
-            });
+            const pollRes = await fetch(
+              apiPath(`/api/rt/poll?sid=${encodeURIComponent(sid)}`),
+              { signal: controller.signal }
+            );
             if (pollRes.status === 404) {
               httpSidRef.current = null;
               transportModeRef.current = null;
@@ -278,13 +345,9 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
       void pollLoop(data.sid);
     } catch {
       if (!mountedRef.current) return;
-      setConnected(false);
-      setTransportStatus('error');
-      setConnectionHint(
-        'Server game belum terjangkau dari Owlbear Rodeo. Pastikan memakai URL publik/Share atau deployment aktif (bukan URL preview privat).'
-      );
+      activateServerlessFallback();
     }
-  }, [enabled, flushPendingQueue, handleServerMessage]);
+  }, [activateServerlessFallback, enabled, flushPendingQueue, handleServerMessage]);
 
   const connectSocket = useCallback(() => {
     if (!enabled) return;
@@ -293,7 +356,9 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
         wsRef.current &&
         (wsRef.current.readyState === WebSocket.OPEN ||
           wsRef.current.readyState === WebSocket.CONNECTING)) ||
-      (transportModeRef.current === 'http' && httpSidRef.current)
+      (transportModeRef.current === 'http' && httpSidRef.current) ||
+      ((transportModeRef.current === 'obr' || transportModeRef.current === 'local') &&
+        serverlessRef.current)
     ) {
       return;
     }
@@ -303,10 +368,9 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
     setTransportStatus('connecting');
     setConnectionHint(null);
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     let ws: WebSocket;
     try {
-      ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      ws = new WebSocket(getWebSocketUrl());
     } catch {
       void startHttpFallback();
       return;
@@ -316,10 +380,10 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
     let opened = false;
 
     wsTimeoutRef.current = setTimeout(() => {
-      if (!opened && mountedRef.current && transportModeRef.current !== 'http') {
+      if (!opened && mountedRef.current && transportModeRef.current === null) {
         void startHttpFallback();
       }
-    }, 2500);
+    }, 2000);
 
     ws.onopen = () => {
       opened = true;
@@ -335,7 +399,7 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
     };
 
     ws.onerror = () => {
-      if (!opened && mountedRef.current && transportModeRef.current !== 'http') {
+      if (!opened && mountedRef.current && transportModeRef.current === null) {
         void startHttpFallback();
       }
     };
@@ -348,7 +412,7 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
       if (wsRef.current === ws) {
         wsRef.current = null;
       }
-      if (!opened && mountedRef.current && transportModeRef.current !== 'http') {
+      if (!opened && mountedRef.current && transportModeRef.current === null) {
         void startHttpFallback();
         return;
       }
@@ -380,8 +444,13 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
     if (enabled) {
       connectSocket();
     }
+    const handleUnload = () => {
+      cleanupTransports();
+    };
+    window.addEventListener('pagehide', handleUnload);
     return () => {
       mountedRef.current = false;
+      window.removeEventListener('pagehide', handleUnload);
       cleanupTransports();
     };
   }, [enabled, connectSocket, cleanupTransports]);
@@ -393,11 +462,18 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
         return;
       }
       if (transportModeRef.current === 'http' && httpSidRef.current) {
-        void fetch('/api/rt/send', {
+        void fetch(apiPath('/api/rt/send'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sid: httpSidRef.current, payload }),
         });
+        return;
+      }
+      if (
+        (transportModeRef.current === 'obr' || transportModeRef.current === 'local') &&
+        serverlessRef.current
+      ) {
+        serverlessRef.current.send(payload);
         return;
       }
       pendingQueueRef.current.push(payload);
@@ -452,20 +528,22 @@ export function useDetectiveSocket(options: UseDetectiveSocketOptions = {}) {
 
   const sendCursorMove = useCallback((x: number, y: number) => {
     const now = performance.now();
-    const minInterval = transportModeRef.current === 'http' ? 120 : 35;
+    const minInterval =
+      transportModeRef.current === 'http' || transportModeRef.current === 'obr' ? 100 : 35;
     if (now - lastCursorSentRef.current < minInterval) return;
     lastCursorSentRef.current = now;
+
+    const payload: ClientMessage = { type: 'cursor:move', x, y };
     if (transportModeRef.current === 'ws' && wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'cursor:move', x, y } satisfies ClientMessage));
+      wsRef.current.send(JSON.stringify(payload));
     } else if (transportModeRef.current === 'http' && httpSidRef.current) {
-      void fetch('/api/rt/send', {
+      void fetch(apiPath('/api/rt/send'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sid: httpSidRef.current,
-          payload: { type: 'cursor:move', x, y } satisfies ClientMessage,
-        }),
+        body: JSON.stringify({ sid: httpSidRef.current, payload }),
       }).catch(() => {});
+    } else if (transportModeRef.current === 'obr' && serverlessRef.current) {
+      serverlessRef.current.send(payload);
     }
   }, []);
 

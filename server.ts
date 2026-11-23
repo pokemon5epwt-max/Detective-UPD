@@ -831,6 +831,7 @@ async function startServer(): Promise<void> {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, HEAD, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
@@ -839,6 +840,25 @@ async function startServer(): Promise<void> {
   });
 
   app.use(express.json());
+
+  app.get('/manifest.json', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-cache');
+    res.json({
+      name: 'Hoenn Detective Agency',
+      version: '1.0.0',
+      manifest_version: 1,
+      icon: '/owlbear-icon.svg',
+      description:
+        'Game investigasi detektif co-op real-time untuk 1-5 pemain dengan fase TKP, interogasi saksi, dan voting vonis.',
+      action: {
+        title: 'Hoenn Detective Agency',
+        icon: '/owlbear-icon.svg',
+        popover: '/?obr=popover',
+        width: 380,
+        height: 480,
+      },
+    });
+  });
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, activeRooms: rooms.size });

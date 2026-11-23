@@ -223,8 +223,12 @@ export function TitleLobbyScreen({
                       }
                     >
                       {connected
-                        ? transportStatus === 'http'
+                        ? transportStatus === 'obr'
+                          ? 'Terhubung via Owlbear Rodeo'
+                          : transportStatus === 'http'
                           ? 'Terhubung (Mode Kompatibel)'
+                          : transportStatus === 'local'
+                          ? 'Mode Solo Lokal'
                           : 'Terhubung ke server'
                         : transportStatus === 'error'
                         ? 'Gagal terhubung'
@@ -244,7 +248,7 @@ export function TitleLobbyScreen({
                   )}
                 </div>
 
-                {connectionHint && !connected && (
+                {connectionHint && (
                   <p className="mt-2 rounded-lg border border-amber-500/40 bg-amber-950/35 px-3 py-2 text-xs leading-relaxed text-amber-200">
                     {connectionHint}
                   </p>
@@ -378,9 +382,11 @@ export function TitleLobbyScreen({
                       {typeof window !== 'undefined' &&
                         window.location.hostname.includes('ais-dev-') && (
                           <p className="text-[11px] leading-relaxed text-amber-300/90">
-                            Catatan: URL preview dev membutuhkan login Google. Agar stabil di dalam
-                            Owlbear Rodeo, gunakan URL publik hasil Share / Deploy (mis. Fly.io atau
-                            App URL yang sudah dipublikasikan).
+                            Penting: URL preview dev (<code className="font-mono">ais-dev</code>)
+                            memblokir akses luar dan akan memunculkan{' '}
+                            <span className="font-semibold">Failed to fetch</span> di Owlbear Rodeo.
+                            Publikasikan/Share app terlebih dahulu (atau deploy ke Fly.io), lalu
+                            tempel <code className="font-mono">URL-Publik/manifest.json</code>.
                           </p>
                         )}
                     </div>
