@@ -1,0 +1,14 @@
+{
+  "name": "Hoenn Detective Agency",
+  "version": "1.0.0",
+  "manifest_version": 1,
+  "icon": "/owlbear-icon.svg",
+  "description": "Game investigasi detektif co-op real-time untuk 1-5 pemain dengan fase TKP, interogasi saksi, dan voting vonis.",
+  "action": {
+    "title": "Hoenn Detective Agency",
+    "icon": "/owlbear-icon.svg",
+    "popover": "/?obr=popover",
+    "width": 380,
+    "height": 480
+  }
+}

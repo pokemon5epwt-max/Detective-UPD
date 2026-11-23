@@ -1,0 +1,6 @@
+{
+  "name": "Hoenn Detective Agency",
+  "description": "Game detektif co-op 2D multiplayer real-time untuk 4-5 pemain di wilayah Hoenn.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

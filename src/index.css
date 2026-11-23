@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Fraunces", Georgia, serif;
+  --font-sans: "Plus Jakarta Sans", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+    background-color: #0f172a;
+    color: #f1f5f9;
+  }
+
+  h1, h2, .font-display {
+    font-family: var(--font-display);
+  }
+}
+
+@keyframes cluePop {
+  0% {
+    opacity: 0;
+    transform: scale(0.82);
+  }
+  65% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-clue-pop {
+  animation: cluePop 190ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes penaltyShake {
+  0%, 100% {
+    transform: translate(-50%, -50%) translateX(0);
+  }
+  25% {
+    transform: translate(-50%, -50%) translateX(-5px);
+  }
+  75% {
+    transform: translate(-50%, -50%) translateX(5px);
+  }
+}
+
+.animate-penalty-shake {
+  animation: penaltyShake 180ms ease-out forwards;
+}
